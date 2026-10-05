@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
+import 'fake-indexeddb/auto';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createWorkbench } from './store.svelte';
+import { storage } from './storage';
 
 describe('工作台交互与响应式求解', () => {
   let wb: ReturnType<typeof createWorkbench>;
@@ -131,5 +133,104 @@ describe('工作台交互与响应式求解', () => {
     wb.tool = 'wire';
     wb.connect(a.id, b.id);
     expect(lastComp().type).toBe('wire');
+  });
+
+  it('对照快照：捕获→改电阻可见差值→清除不改电路且不影响其他工程', async () => {
+    const g = wb.addNode(0, 0);
+    const p = wb.addNode(100, 0);
+    wb.setGround(g.id);
+    wb.tool = 'V';
+    const v = wb.connect(p.id, g.id)!;
+    wb.tool = 'R';
+    const r = wb.connect(p.id, g.id)!;
+    wb.updateComp(v.id, { value: 10 });
+    wb.updateComp(r.id, { value: 10 });
+    expect(wb.result.ok).toBe(true);
+
+    // 另一个工程：验证快照互不干扰
+    const other = createWorkbench();
+    const og = other.addNode(0, 0);
+    const op = other.addNode(100, 0);
+    other.setGround(og.id);
+    other.tool = 'V';
+    const ov = other.connect(op.id, og.id)!;
+    other.tool = 'R';
+    const orr = other.connect(op.id, og.id)!;
+    other.updateComp(ov.id, { value: 3 });
+    other.updateComp(orr.id, { value: 3 });
+    await other.takeSnapshot();
+
+    await wb.takeSnapshot();
+    expect(wb.snapshot).not.toBeNull();
+    const projectId = wb.circuit.id;
+    // 快照已进入 IndexedDB
+    expect((await storage.getSnapshot(projectId))).not.toBeUndefined();
+
+    // 只改一个电阻
+    wb.updateComp(r.id, { value: 40 });
+    const d = wb.snapshotDiff;
+    expect(d.hasSnapshot).toBe(true);
+    const row = d.comps.find((x) => x.id === r.id)!;
+    expect(row.status).toBe('changed');
+    expect(row.i.delta).toBeCloseTo(-0.75, 9);
+
+    // 清除前记录当前电路
+    const circuitBefore = JSON.stringify(wb.circuit);
+    await wb.clearSnapshot();
+    expect(wb.snapshot).toBeNull();
+    expect(await storage.getSnapshot(projectId)).toBeUndefined();
+    // 当前电路完全不变
+    expect(JSON.stringify(wb.circuit)).toBe(circuitBefore);
+    // 其他工程的快照不受影响
+    expect(await storage.getSnapshot(other.circuit.id)).not.toBeUndefined();
+  });
+
+  it('快照随工程持久化：重开（restoreLast）后仍能对照，删除元件后基准值仍可查', async () => {
+    const g = wb.addNode(0, 0);
+    const p = wb.addNode(100, 0);
+    wb.setGround(g.id);
+    wb.tool = 'V';
+    const v = wb.connect(p.id, g.id)!;
+    wb.tool = 'R';
+    const r = wb.connect(p.id, g.id)!;
+    wb.updateComp(v.id, { value: 10 });
+    wb.updateComp(r.id, { value: 10 });
+    await wb.saveNow();
+    await wb.takeSnapshot();
+
+    // 模拟重开：新建工作台并恢复上次工程
+    localStorage.setItem('dcw:current', wb.circuit.id);
+    const reopened = createWorkbench();
+    expect(await reopened.restoreLast()).toBe(true);
+    // 快照为异步加载，等待微任务
+    await Promise.resolve();
+    await new Promise((res) => setTimeout(res, 0));
+    expect(reopened.snapshot).not.toBeNull();
+
+    // 删除元件后基准值仍可查看
+    reopened.selection = { kind: 'comp', id: r.id };
+    reopened.deleteSelection();
+    const d = reopened.snapshotDiff;
+    const row = d.comps.find((x) => x.id === r.id)!;
+    expect(row.status).toBe('removed');
+    expect(row.i.base).toBeCloseTo(1, 9);
+    expect(row.i.now).toBeNull();
+  });
+
+  it('无法求解时也能存快照：诊断保留、摘要无数值', async () => {
+    const g = wb.addNode(0, 0);
+    const p = wb.addNode(100, 0);
+    wb.setGround(g.id);
+    wb.tool = 'V';
+    const v1 = wb.connect(p.id, g.id)!;
+    wb.updateComp(v1.id, { value: 12 });
+    const v2 = wb.connect(p.id, g.id)!;
+    wb.updateComp(v2.id, { value: 5 });
+    expect(wb.result.ok).toBe(false);
+
+    await wb.takeSnapshot();
+    expect(wb.snapshot!.summary.ok).toBe(false);
+    expect(wb.snapshot!.summary.issues.some((i) => i.code === 'VSOURCE_LOOP')).toBe(true);
+    expect(Object.keys(wb.snapshot!.summary.branches)).toHaveLength(0);
   });
 });

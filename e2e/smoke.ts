@@ -179,6 +179,116 @@ check('Konva canvas 已挂载', jumpPaths >= 1, `${jumpPaths} canvas`);
 const realErrors = errors.filter((e) => !/favicon/i.test(e));
 check('浏览器无运行时错误', realErrors.length === 0, realErrors.slice(0, 3).join(' | '));
 
+// ---------- 11. 对照快照：改电阻 → 看支路差值 → 删除元件基准值仍在 → 清除不改电路 → 工程隔离 ----------
+async function worldClick(x: number, y: number) {
+  // 初始视图无缩放/平移：屏幕坐标 = 舞台偏移 + 世界坐标
+  const box = await page.locator('.canvas-wrap').boundingBox();
+  if (!box) throw new Error('canvas wrap missing');
+  await page.mouse.click(box.x + x, box.y + y);
+  await page.waitForTimeout(120);
+}
+
+async function wbCompsCount() {
+  return page.evaluate(() => {
+    const r = (window as unknown as { __renderer?: { stage: { find: (s: string) => unknown[] } } }).__renderer;
+    return r ? r.stage.find('Group').length : -1;
+  });
+}
+
+async function snapshotCountInDb() {
+  return page.evaluate(async () => {
+    return await new Promise((resolve) => {
+      const req = indexedDB.open('dc-workbench');
+      req.onsuccess = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains('snapshots')) return resolve(0);
+        const tx = db.transaction('snapshots', 'readonly');
+        tx.objectStore('snapshots').getAll().onsuccess = (e) =>
+          resolve(((e.target as IDBRequest).result ?? []).length);
+        tx.onerror = () => resolve(-1);
+      };
+      req.onerror = () => resolve(-1);
+    });
+  });
+}
+
+page.on('dialog', (d) => d.accept()); // 清除快照确认框
+
+await page.getByRole('button', { name: /载入示例/ }).click();
+await page.getByRole('button', { name: '桥式网络' }).click();
+await page.waitForTimeout(400);
+
+// 11a. 保存当前为对照快照
+await page.getByRole('button', { name: /对照快照/ }).click();
+await page.waitForTimeout(150);
+await page.getByRole('button', { name: /保存当前为对照快照/ }).click();
+await page.waitForTimeout(400);
+await page.getByRole('button', { name: /对照快照/ }).click();
+await page.waitForTimeout(200);
+check('快照：已保存只读基准', (await page.locator('.snap-pin').count()) === 1);
+
+// 11b. 只改一个电阻：R1 为 n_top(400,80)→n_l(200,280) 的中点 (300,180)
+await worldClick(300, 180);
+await page.waitForTimeout(150);
+await page.locator('.inspector input').nth(1).fill('200');
+await page.locator('.inspector input').nth(1).dispatchEvent(new Event('change', { bubbles: true }));
+await page.waitForTimeout(300);
+await page.getByRole('button', { name: /对照快照/ }).click();
+await page.waitForTimeout(200);
+
+// 找到 R1 行并读取其 ΔI 单元格（列：状态0 元件1 参数2 V基3 V当4 ΔV5 I基6 I当7 ΔI8 …）
+const r1Row = page.locator('table.diff-table tbody tr', { hasText: 'R1' }).first();
+check('快照：改 R1 后 R1 行标记为变化', await r1Row.locator('.status.changed').count() === 1);
+const r1DeltaI = await r1Row.locator('td').nth(8).innerText();
+const dI = Number(r1DeltaI.replace(/[^\d.eE+-]/g, ''));
+check('快照：R1 支路电流出现非零差值 ΔI', Number.isFinite(dI) && Math.abs(dI) > 1e-6, `ΔI=${r1DeltaI.trim()}`);
+// 对照页全页不得出现 NaN
+const snapText = await page.locator('.panel .content').innerText();
+check('快照：对照页不出现 NaN', !/NaN/.test(snapText.replace(/不会出现\s*NaN/g, '')));
+
+// 11c. 删除元件后基准值仍可查看：选中 R5（n_l→n_r 中点 (400,280)）并删除
+await worldClick(400, 280);
+await page.waitForTimeout(150);
+const inspectorTitle = await page.locator('.inspector h3').innerText();
+if (/R5/.test(inspectorTitle)) {
+  await page.getByRole('button', { name: '删除元件' }).click();
+  await page.waitForTimeout(300);
+  await page.getByRole('button', { name: /对照快照/ }).click();
+  const r5Row = page.locator('table.diff-table tbody tr', { hasText: 'R5' }).first();
+  check('快照：删除 R5 后行标记删除', await r5Row.locator('.status.removed').count() === 1);
+  const r5BaseI = await r5Row.locator('td').nth(6).innerText();
+  const baseI = Number(r5BaseI.replace(/[^\d.eE+-]/g, ''));
+  check('快照：被删 R5 的基准电流仍可查看', Number.isFinite(baseI), `I基=${r5BaseI.trim()}`);
+} else {
+  check('快照：删除 R5 后行标记删除', false, `未选中 R5（选中：${inspectorTitle}）`);
+  check('快照：被删 R5 的基准电流仍可查看', false);
+}
+
+// 11d. 清除快照不改变当前电路：记录元件数，清除，元件仍在
+const compsBeforeClear = await wbCompsCount();
+await page.getByRole('button', { name: '清除快照' }).click();
+await page.waitForTimeout(300);
+check('快照：清除后基准消失', (await page.locator('.snap-pin').count()) === 0);
+check(
+  '快照：清除不改变当前电路',
+  (await wbCompsCount()) === compsBeforeClear,
+  `清除前 ${compsBeforeClear} / 清除后 ${await wbCompsCount()}`,
+);
+
+// 11e. 快照随工程保存且与其他工程隔离：在工程 A 存快照 → 新建工程 B 无快照 → 切回 A 快照仍在
+await page.getByRole('button', { name: /保存当前为对照快照/ }).click();
+await page.waitForTimeout(300);
+check('快照：重新保存基准成功', (await page.locator('.snap-pin').count()) === 1);
+
+await page.getByRole('button', { name: /工程/ }).click();
+await page.getByRole('button', { name: '新建工程' }).click();
+await page.waitForTimeout(500);
+await page.getByRole('button', { name: /对照快照/ }).click();
+await page.waitForTimeout(150);
+check('快照：新工程没有继承其他工程的基准', (await page.locator('.snap-pin').count()) === 0);
+const snapInDbA = await snapshotCountInDb();
+check('快照：IndexedDB 中基准仍属于原工程（重开可取回）', snapInDbA >= 1, `${snapInDbA} 条快照`);
+
 await browser.close();
 
 const failed = results.filter((r) => !r.ok);

@@ -3,6 +3,7 @@ import type { AnalysisResult } from './engine/types';
 import { analyze } from './engine/analyze';
 import { makeComp, makeNode, newCircuit } from './factory';
 import { storage } from './storage';
+import { diffSnapshot, summarize, type Snapshot, type SnapshotDiff } from './snapshot';
 
 export type Tool = 'select' | 'node' | 'wire' | 'R' | 'V' | 'I';
 export type Selection = { kind: 'node' | 'comp'; id: string } | null;
@@ -25,10 +26,15 @@ export function createWorkbench() {
     pendingNode: null as string | null,
     highlight: { compIds: [], nodeIds: [] } as Highlight,
     saveState: 'idle' as 'idle' | 'saving' | 'saved' | 'error',
+    /** 对照快照（只读基准）；null 表示当前工程没有快照 */
+    snapshot: null as Snapshot | null,
+    snapshotBusy: false,
   });
 
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   const result = $derived(analyze(state.circuit));
+  /** 当前电路与基准快照的逐项对照；无快照时 hasSnapshot=false */
+  const snapshotDiff = $derived(diffSnapshot(state.snapshot, state.circuit, result));
   const selectedComp = $derived(
     state.selection?.kind === 'comp'
       ? (state.circuit.comps.find((c) => c.id === state.selection!.id) ?? null)
@@ -62,8 +68,49 @@ export function createWorkbench() {
     state.circuit = circuit;
     state.selection = null;
     state.pendingNode = null;
+    state.snapshot = null;
     localStorage.setItem('dcw:current', circuit.id);
     scheduleSave();
+    void loadSnapshot(circuit.id);
+  }
+
+  /** 防止异步切换工程时旧工程的快照晚到、覆盖新工程的基准 */
+  let loadToken = 0;
+  async function loadSnapshot(projectId: string) {
+    const token = ++loadToken;
+    try {
+      const snap = await storage.getSnapshot(projectId);
+      if (token === loadToken && state.circuit.id === projectId) state.snapshot = snap ?? null;
+    } catch (e) {
+      console.warn('读取对照快照失败', e);
+    }
+  }
+
+  /** 保存当前电路与求解摘要为只读基准；当前侧即使无法求解也照存其诊断 */
+  async function takeSnapshot() {
+    // 先同步完成所有对响应式状态的读取与计算（避免在 await 之后再读代理）
+    const projectId = state.circuit.id;
+    const circuit: Circuit = JSON.parse(JSON.stringify(state.circuit));
+    const summary = summarize(circuit, analyze(circuit));
+    const snap: Snapshot = { projectId, createdAt: Date.now(), circuit, summary };
+    state.snapshotBusy = true;
+    try {
+      await storage.putSnapshot(snap);
+      state.snapshot = snap;
+    } finally {
+      state.snapshotBusy = false;
+    }
+  }
+
+  /** 清除快照：只删除基准，绝不改动当前电路，也不触碰其他工程 */
+  async function clearSnapshot() {
+    const projectId = state.circuit.id;
+    state.snapshot = null;
+    try {
+      await storage.removeSnapshot(projectId);
+    } catch (e) {
+      console.warn('清除对照快照失败', e);
+    }
   }
 
   async function createProject(title?: string) {
@@ -78,6 +125,8 @@ export function createWorkbench() {
       const c = await storage.get(id);
       if (c) {
         state.circuit = c;
+        state.snapshot = null;
+        void loadSnapshot(c.id);
         return true;
       }
     } catch (e) {
@@ -237,6 +286,15 @@ export function createWorkbench() {
     get result(): AnalysisResult {
       return result;
     },
+    get snapshot(): Snapshot | null {
+      return state.snapshot;
+    },
+    get snapshotBusy(): boolean {
+      return state.snapshotBusy;
+    },
+    get snapshotDiff(): SnapshotDiff {
+      return snapshotDiff;
+    },
     get selectedComp() {
       return selectedComp;
     },
@@ -258,6 +316,8 @@ export function createWorkbench() {
     updateComp,
     updateNode,
     setTitle,
+    takeSnapshot,
+    clearSnapshot,
   };
 }
 
