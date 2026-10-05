@@ -10,6 +10,7 @@ describe('App SSR 冒烟', () => {
     expect(body).toContain('MNA 方程与溯源');
     expect(body).toContain('节点 KCL');
     expect(body).toContain('功率平衡');
+    expect(body).toContain('对照快照');
     expect(body).toContain('参考地');
     expect(body).toContain('交叉不产生接点');
     // 空电路走诊断分支，而非渲染出 NaN 数值

@@ -175,7 +175,128 @@ await page.waitForTimeout(300);
 const jumpPaths = await page.evaluate(() => document.querySelectorAll('canvas').length);
 check('Konva canvas 已挂载', jumpPaths >= 1, `${jumpPaths} canvas`);
 
-// ---------- 10. 无控制台错误 ----------
+// ---------- 10. 对照快照 ----------
+await page.getByRole('button', { name: /载入示例/ }).click();
+await page.getByRole('button', { name: '桥式网络' }).click();
+await page.waitForTimeout(400);
+
+// 拍基准：元件 6 行、接点 4 行，初始与基准一致
+await page.getByRole('button', { name: /对照快照/ }).click();
+await page.waitForTimeout(150);
+await page.getByRole('button', { name: /保存当前为对照基准/ }).click();
+await page.waitForTimeout(300);
+const diffCompRows = await page.locator('table.diff-table').first().locator('tbody tr').count();
+const diffNodeRows = await page.locator('table.diff-table').nth(1).locator('tbody tr').count();
+check('对照快照：基准列出全部元件与接点', diffCompRows === 6 && diffNodeRows === 4, `${diffCompRows} 元件 / ${diffNodeRows} 接点`);
+const diffHead = await page.locator('.diff-head').innerText();
+check('对照快照：初始与基准一致', /与基准一致/.test(diffHead), diffHead.slice(0, 60).replace(/\n/g, ' '));
+
+// 只改一个电阻：画布上点选 R1（点击之字线顶点，由实时几何计算），检查器中 100Ω → 150Ω
+const r1Pt = await page.evaluate(() => {
+  const w = (window as unknown as { __wb: any }).__wb;
+  const c = w.circuit.comps.find((x: { name: string }) => x.name === 'R1');
+  const A = w.circuit.nodes.find((n: { id: string }) => n.id === c.a);
+  const B = w.circuit.nodes.find((n: { id: string }) => n.id === c.b);
+  const dx = B.x - A.x;
+  const dy = B.y - A.y;
+  const L = Math.hypot(dx, dy);
+  const ux = dx / L;
+  const uy = dy / L;
+  const t = Math.min(0.92, Math.max(0.08, c.t));
+  const Cx = A.x + ux * t * L - uy * c.offset;
+  const Cy = A.y + uy * t * L + ux * c.offset;
+  // 之字线顶点（元件局部坐标 (-12,-10)：w=48、h=12 的第 2 段折点）旋转到世界坐标
+  const bx = -12;
+  const by = -10;
+  return { x: Cx + bx * ux - by * uy, y: Cy + bx * uy + by * ux };
+});
+const canvasBox = await page.locator('.canvas-wrap').boundingBox();
+await page.mouse.click(canvasBox!.x + r1Pt.x, canvasBox!.y + r1Pt.y);
+await page.waitForTimeout(200);
+const rInput = page.locator('.inspector .field', { hasText: '电阻' }).locator('input');
+await rInput.fill('150');
+await rInput.press('Enter');
+await page.waitForTimeout(300);
+await page.getByRole('button', { name: /对照快照/ }).click();
+await page.waitForTimeout(200);
+const r1RowText = await page.locator('table.diff-table tbody tr', { hasText: 'R1' }).first().innerText();
+check(
+  '对照快照：只改一个电阻后相关支路出现差值',
+  /有变化/.test(r1RowText) && /100\s*→\s*150/.test(r1RowText) && /[+-]\d/.test(r1RowText),
+  r1RowText.replace(/\n/g, ' | ').slice(0, 140),
+);
+const node2RowText = await page.locator('table.diff-table').nth(1).locator('tbody tr', { hasText: /^2\s/ }).first().innerText();
+check('对照快照：相关接点电位差值可见', /有变化/.test(node2RowText), node2RowText.replace(/\n/g, ' | ').slice(0, 100));
+
+// 删除该元件：基准中的值仍可查看
+await page.keyboard.press('Delete');
+await page.waitForTimeout(300);
+const r1GoneText = await page.locator('table.diff-table tbody tr', { hasText: 'R1' }).first().innerText();
+check(
+  '对照快照：删除元件后单独标识且基准值仍可查看',
+  /已删除/.test(r1GoneText) && /100/.test(r1GoneText) && /—/.test(r1GoneText),
+  r1GoneText.replace(/\n/g, ' | ').slice(0, 140),
+);
+check('对照快照：界面无数值 NaN', !/NaN/.test((await page.locator('.panel').innerText()).replace(/不会出现\s*NaN/g, '')));
+
+// 重开（刷新）后基准仍在，可继续比较；先等防抖保存落库
+await page.waitForFunction(
+  () => (window as unknown as { __wb: { saveState: string } }).__wb.saveState === 'saved',
+  { timeout: 8000 },
+);
+await page.reload({ waitUntil: 'networkidle' });
+await page.waitForTimeout(800);
+const startBtn2 = page.getByRole('button', { name: '开始实验' });
+if (await startBtn2.count()) await startBtn2.click();
+await page.waitForTimeout(300);
+await page.getByRole('button', { name: /对照快照/ }).click();
+await page.waitForTimeout(200);
+const afterReload = await page.locator('table.diff-table tbody tr', { hasText: 'R1' }).first().innerText();
+check('对照快照：重开工程后基准仍在（随工程入 IndexedDB）', /已删除/.test(afterReload), afterReload.replace(/\n/g, ' | ').slice(0, 100));
+
+// 清除快照：不改变当前电路，也不影响其他工程
+const beforeClear = await page.evaluate(async () => {
+  const w = (window as unknown as { __wb: { circuit: { comps: unknown[]; nodes: unknown[] } } }).__wb;
+  const projects: number = await new Promise((resolve) => {
+    const req = indexedDB.open('dc-workbench');
+    req.onsuccess = () => {
+      const db = req.result;
+      const tx = db.transaction('circuits', 'readonly');
+      tx.objectStore('circuits').getAll().onsuccess = (e) => resolve((e.target as IDBRequest).result.length);
+    };
+    req.onerror = () => resolve(-1);
+  });
+  return { comps: w.circuit.comps.length, nodes: w.circuit.nodes.length, projects };
+});
+await page.getByRole('button', { name: '清除快照' }).click();
+await page.waitForTimeout(900); // 覆盖防抖保存
+const afterClear = await page.evaluate(async () => {
+  const w = (window as unknown as { __wb: { circuit: { comps: unknown[]; nodes: unknown[] }; snapshot: unknown } }).__wb;
+  const projects: number = await new Promise((resolve) => {
+    const req = indexedDB.open('dc-workbench');
+    req.onsuccess = () => {
+      const db = req.result;
+      const tx = db.transaction('circuits', 'readonly');
+      tx.objectStore('circuits').getAll().onsuccess = (e) => resolve((e.target as IDBRequest).result.length);
+    };
+    req.onerror = () => resolve(-1);
+  });
+  return { comps: w.circuit.comps.length, nodes: w.circuit.nodes.length, projects, snap: w.snapshot };
+});
+check(
+  '对照快照：清除快照不改变当前电路',
+  afterClear.snap === null && afterClear.comps === beforeClear.comps && afterClear.nodes === beforeClear.nodes,
+  `元件 ${beforeClear.comps}→${afterClear.comps}，接点 ${beforeClear.nodes}→${afterClear.nodes}`,
+);
+check(
+  '对照快照：清除快照不影响其他工程',
+  afterClear.projects === beforeClear.projects,
+  `工程数 ${beforeClear.projects}→${afterClear.projects}`,
+);
+const emptyAgain = await page.locator('.diff-empty').count();
+check('对照快照：清除后回到未拍快照状态', emptyAgain === 1);
+
+// ---------- 11. 无控制台错误 ----------
 const realErrors = errors.filter((e) => !/favicon/i.test(e));
 check('浏览器无运行时错误', realErrors.length === 0, realErrors.slice(0, 3).join(' | '));
 

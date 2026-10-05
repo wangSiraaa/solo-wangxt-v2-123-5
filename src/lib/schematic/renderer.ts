@@ -266,8 +266,10 @@ export class SchematicRenderer {
 
     this.rebuildOverlays(circuit, geoms);
     this.applySelection(opts);
+    // 同步绘制（而非 batchDraw 延迟到下一帧）：destroyChildren 会立即清空命中画布，
+    // 若绘制延迟到下一帧，期间到达的 mousedown 会因命中画布为空而被吞掉
     for (const layer of [this.leadLayer, this.crossLayer, this.bodyLayer, this.nodeLayer, this.labelLayer, this.overlayLayer]) {
-      layer.batchDraw();
+      layer.draw();
     }
   }
 

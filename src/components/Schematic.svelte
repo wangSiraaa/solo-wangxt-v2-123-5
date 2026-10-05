@@ -49,6 +49,7 @@
     renderer = new SchematicRenderer(containerEl);
     if (import.meta.env.DEV) {
       (window as unknown as { __renderer?: unknown }).__renderer = renderer;
+      (window as unknown as { __wb?: unknown }).__wb = wb;
     }
     const ro = new ResizeObserver(() => renderer?.resize());
     ro.observe(containerEl);
@@ -72,7 +73,10 @@
     return () => {
       window.removeEventListener('keydown', onKey);
       ro.disconnect();
-      if (import.meta.env.DEV) delete (window as unknown as { __renderer?: unknown }).__renderer;
+      if (import.meta.env.DEV) {
+        delete (window as unknown as { __renderer?: unknown }).__renderer;
+        delete (window as unknown as { __wb?: unknown }).__wb;
+      }
       renderer?.destroy();
       renderer = null;
     };

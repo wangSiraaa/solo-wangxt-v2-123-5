@@ -29,6 +29,54 @@ export interface Circuit {
   nodes: Node[];
   comps: Comp[];
   updatedAt: number;
+  /** 对照快照（只读基准）：随工程一起存入 IndexedDB；null/缺省表示未拍快照 */
+  snapshot?: Snapshot | null;
+}
+
+/** 快照中保留的诊断（refs 已在拍照时解析为名字，快照是只读的） */
+export interface SnapshotIssue {
+  kind: IssueKind;
+  code: string;
+  message: string;
+  detail?: string;
+  refNames: string[];
+}
+
+export interface SnapshotNode {
+  id: string;
+  name: string;
+  ground: boolean;
+  /** 拍照时的节点电位；当时不可解则为 null（不以 NaN 冒充） */
+  voltage: number | null;
+}
+
+export interface SnapshotBranch {
+  compId: string;
+  name: string;
+  type: CompType;
+  value: number;
+  aId: string;
+  bId: string;
+  aName: string;
+  bName: string;
+  va: number | null;
+  vb: number | null;
+  v: number | null;
+  i: number | null; // 零阻支路电流不唯一时为 null
+  absorbed: number | null;
+  note?: string;
+}
+
+/** 对照快照：某一时刻的电路身份信息与求解摘要（只读基准） */
+export interface Snapshot {
+  id: string;
+  createdAt: number;
+  circuitTitle: string;
+  ok: boolean; // 拍照时是否求解成功
+  issues: SnapshotIssue[]; // 拍照时的诊断（求解失败时完整保留）
+  nodes: SnapshotNode[];
+  branches: SnapshotBranch[];
+  power: { totalAbsorbed: number; relative: number } | null;
 }
 
 export type IssueKind = 'error' | 'warning' | 'ok';

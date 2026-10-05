@@ -1,9 +1,11 @@
 <script lang="ts">
   import { wb } from '../lib/wb.svelte.ts';
   import { fmt } from '../lib/engine/analyze';
+  import { differs, type DiffStatus } from '../lib/snapshot';
+  import { TYPE_LABEL, UNIT } from '../lib/factory';
   import type { Issue } from '../lib/engine/types';
 
-  let tab = $state<'issues' | 'mna' | 'kcl' | 'power'>('issues');
+  let tab = $state<'issues' | 'mna' | 'kcl' | 'power' | 'diff'>('issues');
 
   $effect(() => {
     if (wb.result.issues.some((i) => i.kind === 'error')) tab = 'issues';
@@ -43,7 +45,43 @@
 
   const errCount = $derived(result.issues.filter((i) => i.kind === 'error').length);
   const warnCount = $derived(result.issues.filter((i) => i.kind === 'warning').length);
+
+  // 对照快照
+  const snap = $derived(wb.snapshot);
+  const diff = $derived(wb.snapshotDiff);
+  const diffCount = $derived(diff ? diff.counts.changed + diff.counts.added + diff.counts.removed : 0);
+  const curErrors = $derived(result.issues.filter((i) => i.kind === 'error'));
+  const fmtDelta = (d: number) => `${d > 0 ? '+' : ''}${fmt(d)}`;
+  const fmtQty = (x: number | null) => (x === null ? '—' : fmt(x));
+
+  function hoverRow(kind: 'comp' | 'node', id: string, gone: boolean) {
+    // 已删除的对象不在当前电路中，无法高亮
+    if (gone) return;
+    wb.highlight = kind === 'comp' ? { compIds: [id], nodeIds: [] } : { compIds: [], nodeIds: [id] };
+  }
 </script>
+
+{#snippet statusBadge(status: DiffStatus)}
+  {#if status === 'added'}<span class="badge added">新增</span>
+  {:else if status === 'removed'}<span class="badge removed">已删除</span>
+  {:else if status === 'changed'}<span class="badge changed">有变化</span>
+  {:else}<span class="muted">—</span>{/if}
+{/snippet}
+
+{#snippet qty(base: number | null, cur: number | null)}
+  {#if base === null && cur === null}
+    <span class="muted">—</span>
+  {:else if base !== null && cur !== null && !differs(base, cur)}
+    <span class="mono">{fmt(base)}</span>
+  {:else}
+    <span class="mono">{fmtQty(base)}</span>
+    <span class="arrow">→</span>
+    <span class="mono hl">{fmtQty(cur)}</span>
+    {#if base !== null && cur !== null}
+      <span class="mono delta">{fmtDelta(cur - base)}</span>
+    {/if}
+  {/if}
+{/snippet}
 
 <section class="panel">
   <nav class="tabs">
@@ -56,6 +94,11 @@
     <button class:active={tab === 'mna'} onclick={() => (tab = 'mna')}>MNA 方程与溯源</button>
     <button class:active={tab === 'kcl'} onclick={() => (tab = 'kcl')}>节点 KCL</button>
     <button class:active={tab === 'power'} onclick={() => (tab = 'power')}>功率平衡</button>
+    <button class:active={tab === 'diff'} onclick={() => (tab = 'diff')}>
+      对照快照
+      {#if snap && diffCount > 0}<span class="badge warning">{diffCount}</span>{/if}
+      {#if snap && diffCount === 0}<span class="badge ok">✓</span>{/if}
+    </button>
   </nav>
 
   <div class="content scroll">
@@ -212,6 +255,166 @@
         </div>
       {:else}
         <div class="placeholder">无解：功率平衡在求解成功后给出。</div>
+      {/if}
+    {:else if tab === 'diff'}
+      {#if !snap}
+        <div class="diff-empty">
+          <p>
+            <b>对照快照</b>：把当前电路与求解结果保存为<b>只读基准</b>；继续修改后，在此按元件和接点对比
+            <b>电位 / 电流 / 功率</b>的变化，新增或删除的对象会单独标识。
+          </p>
+          <p class="muted">
+            基准随工程存入 IndexedDB，重开工程仍可对照；若基准或当前任一侧无法求解，其诊断会被保留，差值不会用
+            NaN 冒充。
+          </p>
+          <button class="primary" onclick={() => wb.takeSnapshot()}>📸 保存当前为对照基准</button>
+        </div>
+      {:else if diff}
+        <div class="diff">
+          <div class="diff-head">
+            <div class="diff-meta">
+              <b>基准：{snap.circuitTitle}</b>
+              <span class="muted">拍于 {new Date(snap.createdAt).toLocaleString('zh-CN')}</span>
+              {#if !diff.baseOk}<span class="badge error">基准不可解</span>{/if}
+              {#if !diff.curOk}<span class="badge error">当前不可解</span>{/if}
+            </div>
+            <div class="diff-actions">
+              <span class="muted">
+                {#if diffCount === 0}
+                  与基准一致（电气量无变化）
+                {:else}
+                  {diff.counts.changed} 项变化 · {diff.counts.added} 新增 · {diff.counts.removed} 已删除
+                {/if}
+                · Σ吸收功率：{fmtQty(diff.basePower)} → {fmtQty(diff.curPower)} W
+              </span>
+              <button onclick={() => wb.takeSnapshot()} title="丢弃旧基准，以当前电路与求解结果重新拍照">
+                ↻ 以当前重拍基准
+              </button>
+              <button
+                class="danger"
+                onclick={() => wb.clearSnapshot()}
+                title="只删除基准快照：不改变当前电路，也不影响其他工程"
+              >
+                清除快照
+              </button>
+            </div>
+          </div>
+
+          {#if !diff.baseOk}
+            <div class="diag-box">
+              <div class="diag-title">
+                基准保存时电路无法求解，其诊断已完整保留（基准量值显示为 —，不以 NaN 冒充）：
+              </div>
+              {#each snap.issues as issue, k (k)}
+                <div class="issue {issue.kind}">
+                  <span class="badge {issue.kind}">{issue.kind === 'error' ? '错误' : '警告'}</span>
+                  <div class="issue-body">
+                    <div class="msg">{issue.message}</div>
+                    {#if issue.detail}<div class="detail">{issue.detail}</div>{/if}
+                    {#if issue.refNames.length > 0}
+                      <div class="refs">
+                        关联：
+                        {#each issue.refNames as r, j (j)}
+                          <span class="ref">{r}</span>
+                        {/each}
+                      </div>
+                    {/if}
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
+          {#if !diff.curOk}
+            <div class="diag-box">
+              <div class="diag-title">
+                当前电路无法求解——当前侧量值显示为 —（完整诊断见“诊断”页签）：
+              </div>
+              {#each curErrors as issue, k (k)}
+                <div class="diag-line">• {issue.message}</div>
+              {/each}
+            </div>
+          {/if}
+
+          <h4 class="diff-sub">元件对照（V = Va−Vb，I 沿 a→b，P 为吸收功率）</h4>
+          <table class="data diff-table">
+            <thead>
+              <tr>
+                <th>元件</th>
+                <th>状态</th>
+                <th>参数</th>
+                <th>V (V)<br /><span class="th-sub">基准 → 当前（Δ）</span></th>
+                <th>I (A)<br /><span class="th-sub">基准 → 当前（Δ）</span></th>
+                <th>P (W)<br /><span class="th-sub">基准 → 当前（Δ）</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each diff.comps as row (row.compId)}
+                <tr
+                  class={row.status}
+                  onmouseenter={() => hoverRow('comp', row.compId, row.status === 'removed')}
+                  onmouseleave={() => (wb.highlight = { compIds: [], nodeIds: [] })}
+                >
+                  <td>
+                    <b>{row.name}</b>
+                    <span class="muted small">
+                      {TYPE_LABEL[row.type]} · {row.curEndpoints ?? row.baseEndpoints}
+                    </span>
+                    {#if row.connChanged}
+                      <span class="badge changed" title="基准时：{row.baseEndpoints}">接线/极性已变</span>
+                    {/if}
+                    {#if row.cur?.note || row.base?.note}
+                      <div class="small muted">{row.cur?.note ?? row.base?.note}</div>
+                    {/if}
+                  </td>
+                  <td>{@render statusBadge(row.status)}</td>
+                  <td class="mono">
+                    {#if row.type === 'wire'}
+                      —
+                    {:else if row.status === 'added'}
+                      {fmt(row.curValue!)}{UNIT[row.type]}
+                    {:else if row.status === 'removed'}
+                      {fmt(row.baseValue!)}{UNIT[row.type]}
+                    {:else if row.flags.value}
+                      {fmt(row.baseValue!)} → <b>{fmt(row.curValue!)}{UNIT[row.type]}</b>
+                    {:else}
+                      {fmt(row.curValue!)}{UNIT[row.type]}
+                    {/if}
+                  </td>
+                  <td class="mono">{@render qty(row.base?.v ?? null, row.cur?.v ?? null)}</td>
+                  <td class="mono">{@render qty(row.base?.i ?? null, row.cur?.i ?? null)}</td>
+                  <td class="mono">{@render qty(row.base?.p ?? null, row.cur?.p ?? null)}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+
+          <h4 class="diff-sub">接点对照（电位，参考地为 0 V）</h4>
+          <table class="data diff-table">
+            <thead>
+              <tr>
+                <th>接点</th>
+                <th>状态</th>
+                <th>电位 (V)<br /><span class="th-sub">基准 → 当前（Δ）</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each diff.nodes as row (row.nodeId)}
+                <tr
+                  class={row.status}
+                  onmouseenter={() => hoverRow('node', row.nodeId, row.status === 'removed')}
+                  onmouseleave={() => (wb.highlight = { compIds: [], nodeIds: [] })}
+                >
+                  <td>
+                    {row.name}{row.curGround ? ' ⏚' : ''}
+                    {#if row.baseGround && !row.curGround}<span class="muted small">（基准时为 ⏚）</span>{/if}
+                  </td>
+                  <td>{@render statusBadge(row.status)}</td>
+                  <td class="mono">{@render qty(row.baseV, row.curV)}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
       {/if}
     {/if}
   </div>
@@ -431,5 +634,102 @@
   }
   .small {
     font-size: 11px;
+  }
+  .diff-empty {
+    padding: 6px 8px;
+    line-height: 1.8;
+  }
+  .diff-empty .primary {
+    background: #0369a1;
+    border-color: var(--accent);
+    padding: 7px 16px;
+    font-weight: 700;
+    margin-top: 4px;
+  }
+  .diff {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .diff-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  .diff-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .diff-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .diff-sub {
+    margin: 4px 0 -4px;
+    color: #7dd3fc;
+    font-size: 12.5px;
+  }
+  .diag-box {
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--err);
+    border-radius: 8px;
+    padding: 8px 10px;
+    background: var(--panel-2);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .diag-title {
+    color: var(--warn);
+    font-weight: 600;
+  }
+  .diag-line {
+    color: var(--text);
+  }
+  .diff-table th {
+    vertical-align: bottom;
+  }
+  .th-sub {
+    color: var(--muted);
+    font-weight: 400;
+    font-size: 10.5px;
+  }
+  .diff-table tr.changed td {
+    background: rgba(251, 191, 36, 0.07);
+  }
+  .diff-table tr.added td {
+    background: rgba(52, 211, 153, 0.07);
+  }
+  .diff-table tr.removed td {
+    background: rgba(248, 113, 113, 0.07);
+  }
+  .badge.added {
+    background: rgba(52, 211, 153, 0.16);
+    color: var(--ok);
+  }
+  .badge.removed {
+    background: rgba(248, 113, 113, 0.16);
+    color: var(--err);
+  }
+  .badge.changed {
+    background: rgba(251, 191, 36, 0.16);
+    color: var(--warn);
+  }
+  .arrow {
+    color: var(--muted);
+    padding: 0 3px;
+  }
+  .hl {
+    color: #fcd34d;
+  }
+  .delta {
+    color: var(--warn);
+    padding-left: 6px;
   }
 </style>

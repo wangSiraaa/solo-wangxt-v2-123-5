@@ -1,7 +1,8 @@
-import type { Circuit, Comp, CompType, Node } from './engine/types';
+import type { Circuit, Comp, CompType, Node, Snapshot } from './engine/types';
 import type { AnalysisResult } from './engine/types';
 import { analyze } from './engine/analyze';
 import { makeComp, makeNode, newCircuit } from './factory';
+import { buildSnapshot, computeDiff } from './snapshot';
 import { storage } from './storage';
 
 export type Tool = 'select' | 'node' | 'wire' | 'R' | 'V' | 'I';
@@ -29,6 +30,10 @@ export function createWorkbench() {
 
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   const result = $derived(analyze(state.circuit));
+  /** 对照差值：基准快照 × 当前电路 × 当前求解（无快照时为 null） */
+  const snapshotDiff = $derived(
+    state.circuit.snapshot ? computeDiff(state.circuit.snapshot, state.circuit, result) : null,
+  );
   const selectedComp = $derived(
     state.selection?.kind === 'comp'
       ? (state.circuit.comps.find((c) => c.id === state.selection!.id) ?? null)
@@ -187,6 +192,20 @@ export function createWorkbench() {
     scheduleSave();
   }
 
+  /** 拍对照快照：当前电路 + 求解摘要存为只读基准（随工程入 IndexedDB） */
+  function takeSnapshot() {
+    const snap: Snapshot = buildSnapshot(state.circuit, result);
+    state.circuit.snapshot = snap;
+    scheduleSave();
+  }
+
+  /** 清除快照：只摘掉基准，不动当前电路，也不碰其他工程 */
+  function clearSnapshot() {
+    if (!state.circuit.snapshot) return;
+    state.circuit.snapshot = null;
+    scheduleSave();
+  }
+
   function nextCompName(type: CompType): string {
     let k = 1;
     const taken = new Set(state.circuit.comps.map((c) => c.name));
@@ -237,6 +256,12 @@ export function createWorkbench() {
     get result(): AnalysisResult {
       return result;
     },
+    get snapshot(): Snapshot | null {
+      return state.circuit.snapshot ?? null;
+    },
+    get snapshotDiff() {
+      return snapshotDiff;
+    },
     get selectedComp() {
       return selectedComp;
     },
@@ -258,6 +283,8 @@ export function createWorkbench() {
     updateComp,
     updateNode,
     setTitle,
+    takeSnapshot,
+    clearSnapshot,
   };
 }
 
